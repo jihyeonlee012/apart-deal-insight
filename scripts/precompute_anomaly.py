@@ -20,6 +20,7 @@
     location_top10.parquet          시군구별 TOP 1 → 전국 TOP 10
     location_summary.parquet        시군구별 요약 테이블
     location_anomalies.parquet      전국 특이거래 전체 (시군구 선택 조회용)
+    location_anomalies_map.parquet  전국 특이거래 지도용 (위도/경도/거래연도/거래월 포함)
 """
  
 import json
@@ -281,7 +282,17 @@ def run_location(df: pd.DataFrame) -> None:
     ] if c in anomaly_rows.columns]
     anomaly_rows[keep_cols].to_parquet(CACHE_DIR / "location_anomalies.parquet", index=False)
 
-    print(f"  저장 완료 ({time.time()-t:.0f}초) - 4개 파일")
+    # 이상치 지도(시계열 슬라이더)용 — 위도/경도/거래시점 포함 저장
+    map_cols = [c for c in [
+        "시군구", "아파트", "거래금액", "전용면적", "층",
+        "평당가", "위도", "경도", "거래연도", "거래월",
+        "anomaly_score", "anomaly_rank"
+    ] if c in anomaly_rows.columns]
+    anomaly_rows[map_cols].dropna(subset=["위도", "경도"]).to_parquet(
+        CACHE_DIR / "location_anomalies_map.parquet", index=False
+    )
+
+    print(f"  저장 완료 ({time.time()-t:.0f}초) - 5개 파일")
 
 
 # =============================================================================
@@ -307,6 +318,6 @@ if __name__ == "__main__":
     elapsed = time.time() - total_start
     print("\n" + "=" * 60)
     print(f"전체 완료 - 총 소요 시간: {elapsed/60:.1f}분")
-    print(f"저장된 파일 수: 13개")
+    print(f"저장된 파일 수: 14개")
     print("이제 Streamlit 앱이 캐시 파일을 즉시 로드합니다.")
     print("=" * 60)

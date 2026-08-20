@@ -5,10 +5,13 @@ import os
 import sys
 from pathlib import Path
 
+import folium
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from folium.plugins import MarkerCluster
+from streamlit_folium import st_folium
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from utils.ui import page_header, section_badge
@@ -106,6 +109,7 @@ LOCATION_FILES = [
     "location_kpi.json", "location_top10.parquet",
     "location_summary.parquet", "location_anomalies.parquet",
 ]
+LOCATION_MAP_FILES = ["location_anomalies_map.parquet"]
 
 
 def _cache_ready(file_list: list[str]) -> bool:
@@ -152,6 +156,15 @@ def load_location_cache():
     anomalies = pd.read_parquet(CACHE_DIR / "location_anomalies.parquet")
     return kpi, top10, summary, anomalies
 
+
+@st.cache_data(show_spinner="지도 데이터 불러오는 중...")
+def load_location_map_cache() -> pd.DataFrame:
+    df = pd.read_parquet(CACHE_DIR / "location_anomalies_map.parquet")
+    df["위도"] = df["위도"].astype(float)
+    df["경도"] = df["경도"].astype(float)
+    df["연월"] = df["거래연도"].astype(int).astype(str) + "-" + df["거래월"].astype(int).astype(str).str.zfill(2)
+    return df
+
 # =============================================================================
 # 공통 헬퍼
 # =============================================================================
@@ -179,14 +192,27 @@ def _fmt_score(df: pd.DataFrame, col: str = "anomaly_score") -> pd.DataFrame:
         out[col] = out[col].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "-")
     return out
 
+
+def _anomaly_color(score: float, vmin: float, vmax: float) -> str:
+    """anomaly_score가 낮을수록(더 특이할수록) 진한 빨강."""
+    if vmax == vmin:
+        return "#DC2626"
+    ratio = (score - vmin) / (vmax - vmin)
+    if ratio <= 0.20: return "#7F1D1D"
+    if ratio <= 0.40: return "#B91C1C"
+    if ratio <= 0.60: return "#DC2626"
+    if ratio <= 0.80: return "#F87171"
+    return "#FCA5A5"
+
 # =============================================================================
 # 탭 구성
 # =============================================================================
 
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "🌐 전국 단일 모델",
     "🏙️ 서울 구별 모델",
     "📍 전국 시군구별 모델",
+    "🗺️ 이상치 지도 (시계열)",
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -512,6 +538,98 @@ with tab3:
                     lambda x: f"{x:,.0f}만원" if pd.notna(x) else "-"
                 )
         st.dataframe(display_summary_l, use_container_width=True, height=500)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 탭 4: 이상치 지도 (시계열 슬라이더)
+# ─────────────────────────────────────────────────────────────────────────────
+with tab4:
+    if not _cache_ready(LOCATION_MAP_FILES):
+        _no_cache_msg()
+    else:
+        map_df = load_location_map_cache()
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        section_badge("🗺️", "기간별 특이거래 분포 지도")
+        st.caption(
+            "슬라이더로 기간을 옮기면 그 기간에 발생한 특이거래만 지도에 표시됩니다. "
+            "점 색이 진할수록 시군구 내부 기준으로 더 특이한 거래입니다."
+        )
+
+        period_options = sorted(map_df["연월"].unique().tolist())
+
+        preset_col, slider_col = st.columns([1, 4])
+        with preset_col:
+            st.markdown("<br>", unsafe_allow_html=True)
+            surge_preset = st.button("📈 2020~2021 급등기만 보기", use_container_width=True)
+
+        if "anomaly_map_range" not in st.session_state:
+            st.session_state.anomaly_map_range = (period_options[0], period_options[-1])
+
+        if surge_preset:
+            surge_start = next((p for p in period_options if p >= "2020-01"), period_options[0])
+            surge_end   = next((p for p in reversed(period_options) if p <= "2021-12"), period_options[-1])
+            st.session_state.anomaly_map_range = (surge_start, surge_end)
+
+        with slider_col:
+            start_period, end_period = st.select_slider(
+                "기간 선택 (거래연도-월)",
+                options=period_options,
+                value=st.session_state.anomaly_map_range,
+                key="anomaly_map_range",
+            )
+
+        period_df = map_df[(map_df["연월"] >= start_period) & (map_df["연월"] <= end_period)]
+
+        c1, c2, c3 = st.columns(3)
+        _metric_card(c1, "선택 기간", f"{start_period} ~ {end_period}", "거래연도-월 기준")
+        _metric_card(c2, "표시 특이거래 건수", f"{len(period_df):,}건", f"전체 {len(map_df):,}건 중")
+        _metric_card(
+            c3, "최강 이상치 Score",
+            f"{period_df['anomaly_score'].min():.4f}" if len(period_df) else "-",
+            "값이 작을수록 더 특이",
+        )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if period_df.empty:
+            st.info("선택한 기간에는 탐지된 특이거래가 없습니다.")
+        else:
+            MAX_MARKERS = 3000
+            plotted = period_df
+            if len(period_df) > MAX_MARKERS:
+                plotted = period_df.sort_values("anomaly_score", ascending=True).head(MAX_MARKERS)
+                st.caption(f"⚠ 표시 성능을 위해 가장 특이한 {MAX_MARKERS:,}건만 지도에 표시합니다.")
+
+            vmin = float(plotted["anomaly_score"].min())
+            vmax = float(plotted["anomaly_score"].max())
+
+            m = folium.Map(location=[36.5, 127.8], zoom_start=7, tiles="cartodbpositron")
+            cluster = MarkerCluster().add_to(m)
+
+            for row in plotted.itertuples():
+                folium.CircleMarker(
+                    location=[row.위도, row.경도],
+                    radius=5,
+                    color=_anomaly_color(row.anomaly_score, vmin, vmax),
+                    fill=True,
+                    fill_color=_anomaly_color(row.anomaly_score, vmin, vmax),
+                    fill_opacity=0.85,
+                    weight=1,
+                    popup=folium.Popup(
+                        f"<b>{row.시군구} · {row.아파트}</b><br>"
+                        f"거래연월: {row.연월}<br>"
+                        f"거래금액: {row.거래금액:,.0f}만원<br>"
+                        f"평당가: {row.평당가:,.0f}만원<br>"
+                        f"anomaly_score: {row.anomaly_score:.4f}",
+                        max_width=260,
+                    ),
+                ).add_to(cluster)
+
+            st_folium(m, width="100%", height=620, returned_objects=[], key=f"anomaly_map_{start_period}_{end_period}")
 
         st.markdown("<br>", unsafe_allow_html=True)
  
